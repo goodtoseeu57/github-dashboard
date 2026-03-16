@@ -2,10 +2,11 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local};
 use eframe::{
     egui::{
-        self, Align, CentralPanel, Color32, Context, Key, Layout, RichText, ScrollArea, Sense,
-        SidePanel, Stroke, TextEdit, TopBottomPanel, Ui, Vec2, Window,
+        self, vec2, Align, CentralPanel, Color32, Context, CornerRadius, FontFamily, FontId, Key,
+        Layout, RichText, ScrollArea, Sense, SidePanel, Stroke, TextEdit, TextStyle,
+        TopBottomPanel, Ui, Vec2, ViewportBuilder, Window,
     },
-    App, Frame, NativeOptions,
+    App, CreationContext, Frame, NativeOptions,
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
@@ -20,7 +21,7 @@ use std::{
 
 fn main() -> Result<()> {
     let native_options = NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+        viewport: ViewportBuilder::default()
             .with_title("GitHub Dashboard")
             .with_inner_size([1500.0, 960.0])
             .with_min_inner_size([1200.0, 780.0]),
@@ -30,7 +31,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "GitHub Dashboard",
         native_options,
-        Box::new(|_cc| Ok(Box::new(GithubDesktopApp::new()))),
+        Box::new(|cc| Ok(Box::new(GithubDesktopApp::new(cc)))),
     )
     .map_err(|err| anyhow!("failed to start desktop app: {err}"))
 }
@@ -164,7 +165,8 @@ impl Default for DashboardState {
 }
 
 impl GithubDesktopApp {
-    fn new() -> Self {
+    fn new(cc: &CreationContext<'_>) -> Self {
+        apply_theme(&cc.egui_ctx);
         let (watcher, fs_rx) = spawn_git_watcher();
         let mut app = Self {
             state: DashboardState::default(),
@@ -285,7 +287,7 @@ impl GithubDesktopApp {
     fn draw_header(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.heading(
-                RichText::new("GitHub Desktop Dashboard").color(Color32::from_rgb(138, 201, 38)),
+                RichText::new("GitHub Desktop Dashboard").color(Color32::from_rgb(95, 159, 255)),
             );
             ui.separator();
             ui.label(RichText::new(self.state.repo_name.to_uppercase()).strong());
@@ -306,79 +308,230 @@ impl GithubDesktopApp {
         });
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Refresh").clicked() {
+            if toolbar_button(ui, "Refresh").clicked() {
                 self.refresh_data(RefreshKind::Local);
                 self.refresh_data(RefreshKind::Remote);
             }
-            if ui.button("Commit").clicked() {
+            if toolbar_button(ui, "Commit").clicked() {
                 self.state.show_commit_prompt = true;
                 self.state.commit_message_input.clear();
                 self.state.error_msg = None;
             }
-            if ui.button("Push").clicked() {
+            if toolbar_button(ui, "Push").clicked() {
                 push_current_branch(&mut self.state);
             }
-            if ui.button("Show Commit").clicked() {
+            if toolbar_button(ui, "Show Commit").clicked() {
                 load_selected_commit_show(&mut self.state);
             }
-            if ui.button("Open on GitHub").clicked() {
+            if toolbar_button(ui, "Open on GitHub").clicked() {
                 open_selected_commit_on_github(&self.state);
             }
-            if ui.button("Show Diff").clicked() {
+            if toolbar_button(ui, "Show Diff").clicked() {
                 load_selected_file_diff(&mut self.state);
             }
-            if ui.button("Revert File").clicked() {
+            if toolbar_button(ui, "Revert File").clicked() {
                 revert_selected_file(&mut self.state);
             }
-            if ui.button("Revert Hunk").clicked() {
+            if toolbar_button(ui, "Revert Hunk").clicked() {
                 revert_selected_hunk(&mut self.state);
             }
         });
     }
 
-    fn draw_commit_graph(&mut self, ui: &mut Ui) {
-        card_frame(
-            ui,
-            self.state.active_panel == ActivePanel::Commits,
-            "Git Graph",
-            |ui| {
-                ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        if self.state.git_graph.is_empty() {
-                            ui.label(
-                                RichText::new("No git history available").color(Color32::GRAY),
-                            );
-                            return;
-                        }
-                        let mut open_commit_index: Option<usize> = None;
-                        for (index, line) in self.state.git_graph.iter().enumerate() {
-                            let selected = index == self.state.selected_commit_index;
-                            let response = ui
-                                .horizontal(|ui| render_git_graph_line(ui, line, selected))
-                                .response
-                                .interact(Sense::click())
-                                .on_hover_text(
-                                    "Click to select. Double-click to open commit details.",
+    fn draw_commit_sidebar(&mut self, ui: &mut Ui) {
+        let panel_fill = Color32::from_rgb(41, 44, 52);
+        let panel_rect = ui.max_rect();
+        ui.painter().rect_filled(panel_rect, 0.0, panel_fill);
+        ui.set_min_size(panel_rect.size());
+
+        ui.scope(|ui| {
+            ui.set_width(panel_rect.width());
+            ui.set_min_height(panel_rect.height());
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(self.state.repo_name.clone())
+                        .strong()
+                        .color(Color32::from_rgb(222, 226, 234)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(self.state.current_branch.clone()).color(Color32::from_gray(150)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if sidebar_button(ui, "Push", false).clicked() {
+                        push_current_branch(&mut self.state);
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+
+            let change_count = self.state.working_tree.len();
+            let change_summary = if change_count == 0 {
+                "No changes".to_string()
+            } else if change_count == 1 {
+                "1 changed file".to_string()
+            } else {
+                format!("{change_count} changed files")
+            };
+            ui.label(RichText::new(change_summary).color(Color32::from_gray(165)));
+
+            ui.add_space(10.0);
+            soft_separator(ui);
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Recent Commits").color(Color32::from_gray(160)));
+            ui.add_space(6.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 180.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("sidebar_commits")
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            if self.state.git_graph.is_empty() {
+                                ui.label(
+                                    RichText::new("No git history available")
+                                        .color(Color32::from_gray(120)),
                                 );
-                            if response.clicked() {
+                                return;
+                            }
+                            let mut open_commit_index: Option<usize> = None;
+                            for (index, line) in self.state.git_graph.iter().enumerate() {
+                                let selected = index == self.state.selected_commit_index;
+                                let response = ui
+                                    .horizontal(|ui| render_git_graph_line(ui, line, selected))
+                                    .response
+                                    .interact(Sense::click())
+                                    .on_hover_text(
+                                        "Click to select. Double-click to open commit details.",
+                                    );
+                                if response.clicked() {
+                                    self.state.active_panel = ActivePanel::Commits;
+                                    self.state.selected_commit_index = index;
+                                }
+                                if response.double_clicked() {
+                                    self.state.active_panel = ActivePanel::Commits;
+                                    self.state.selected_commit_index = index;
+                                    open_commit_index = Some(index);
+                                }
+                            }
+                            if let Some(index) = open_commit_index {
                                 self.state.active_panel = ActivePanel::Commits;
                                 self.state.selected_commit_index = index;
+                                load_selected_commit_show(&mut self.state);
                             }
-                            if response.double_clicked() {
-                                self.state.active_panel = ActivePanel::Commits;
-                                self.state.selected_commit_index = index;
-                                open_commit_index = Some(index);
+                        });
+                },
+            );
+
+            ui.add_space(8.0);
+            soft_separator(ui);
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Changed Files").color(Color32::from_gray(160)));
+            ui.add_space(6.0);
+
+            let footer_height = 124.0;
+            let files_height = (ui.available_height() - footer_height).max(140.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), files_height),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ScrollArea::vertical()
+                        .id_salt("sidebar_files")
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            if self.state.working_tree.is_empty() {
+                                ui.add_space(12.0);
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(
+                                        RichText::new("No changes to commit")
+                                            .color(Color32::from_gray(120)),
+                                    );
+                                });
+                                return;
                             }
-                        }
-                        if let Some(index) = open_commit_index {
-                            self.state.active_panel = ActivePanel::Commits;
-                            self.state.selected_commit_index = index;
-                            load_selected_commit_show(&mut self.state);
-                        }
-                    });
-            },
-        );
+
+                            let max_total = self
+                                .state
+                                .working_tree
+                                .iter()
+                                .map(|change| change.additions + change.deletions)
+                                .max()
+                                .unwrap_or(1)
+                                .max(1);
+
+                            let mut open_file_index: Option<usize> = None;
+                            for (index, change) in self.state.working_tree.iter().enumerate() {
+                                let selected = index == self.state.selected_file_index;
+                                let response = ui
+                                    .horizontal(|ui| {
+                                        render_file_change_row(ui, change, selected, max_total)
+                                    })
+                                    .response
+                                    .interact(Sense::click())
+                                    .on_hover_text(
+                                        "Click to select. Double-click to open file diff.",
+                                    );
+                                if response.clicked() {
+                                    self.state.active_panel = ActivePanel::Files;
+                                    self.state.selected_file_index = index;
+                                }
+                                if response.double_clicked() {
+                                    self.state.active_panel = ActivePanel::Files;
+                                    self.state.selected_file_index = index;
+                                    open_file_index = Some(index);
+                                }
+                            }
+                            if let Some(index) = open_file_index {
+                                self.state.active_panel = ActivePanel::Files;
+                                self.state.selected_file_index = index;
+                                load_selected_file_diff(&mut self.state);
+                            }
+                        });
+                },
+            );
+
+            ui.add_space(8.0);
+            soft_separator(ui);
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{}/{}",
+                        self.state.repo_name, self.state.current_branch
+                    ))
+                    .color(Color32::from_gray(140)),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if sidebar_button(ui, "Commit Tracked", true).clicked() {
+                        commit_all_changes(&mut self.state);
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(31, 34, 40))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(72, 76, 86)))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    let response = ui.add(
+                        TextEdit::singleline(&mut self.state.commit_message_input)
+                            .hint_text("Enter commit message")
+                            .desired_width(f32::INFINITY)
+                            .font(TextStyle::Body),
+                    );
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        commit_all_changes(&mut self.state);
+                    }
+                });
+        });
     }
 
     fn draw_default_branch(&self, ui: &mut Ui) {
@@ -394,59 +547,6 @@ impl GithubDesktopApp {
             ui.add_space(6.0);
             ui.label(self.state.last_commit_main.clone());
         });
-    }
-
-    fn draw_worktree(&mut self, ui: &mut Ui) {
-        card_frame(
-            ui,
-            self.state.active_panel == ActivePanel::Files,
-            "Worktree / Staging",
-            |ui| {
-                ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        if self.state.working_tree.is_empty() {
-                            ui.label(RichText::new("Working tree clean").color(Color32::GRAY));
-                            return;
-                        }
-
-                        let max_total = self
-                            .state
-                            .working_tree
-                            .iter()
-                            .map(|change| change.additions + change.deletions)
-                            .max()
-                            .unwrap_or(1)
-                            .max(1);
-
-                        let mut open_file_index: Option<usize> = None;
-                        for (index, change) in self.state.working_tree.iter().enumerate() {
-                            let selected = index == self.state.selected_file_index;
-                            let response = ui
-                                .horizontal(|ui| {
-                                    render_file_change_row(ui, change, selected, max_total)
-                                })
-                                .response
-                                .interact(Sense::click())
-                                .on_hover_text("Click to select. Double-click to open file diff.");
-                            if response.clicked() {
-                                self.state.active_panel = ActivePanel::Files;
-                                self.state.selected_file_index = index;
-                            }
-                            if response.double_clicked() {
-                                self.state.active_panel = ActivePanel::Files;
-                                self.state.selected_file_index = index;
-                                open_file_index = Some(index);
-                            }
-                        }
-                        if let Some(index) = open_file_index {
-                            self.state.active_panel = ActivePanel::Files;
-                            self.state.selected_file_index = index;
-                            load_selected_file_diff(&mut self.state);
-                        }
-                    });
-            },
-        );
     }
 
     fn draw_right_column(&self, ui: &mut Ui) {
@@ -509,20 +609,29 @@ impl GithubDesktopApp {
             .map(|change| change.path.clone())
             .unwrap_or_else(|| "clean".to_string());
 
-        card_frame(ui, false, "Controls", |ui| {
-            ui.label("Mouse: use the toolbar buttons, click rows to select, and double-click a commit or file row to open details.");
-            ui.label("Keyboard: Tab/arrows switch focus. C commit, P push, S show commit, D show diff, F revert file, H revert hunk, O open on GitHub, R refresh.");
-            ui.label(
-                "Selected commit and selected file update by clicking a row or using arrow keys.",
-            );
-            ui.label(format!(
-                "Selected commit: {} | Selected file: {}",
-                selected_commit, selected_file
-            ));
-            ui.label(RichText::new(
-                "Hunk revert works on changed line ranges. Git still does not support true column-level undo.",
-            ).color(Color32::from_rgb(255, 214, 10)));
-        });
+        egui::Frame::NONE
+            .fill(Color32::from_rgb(28, 30, 35))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("Selected commit: {selected_commit}"))
+                            .color(Color32::from_gray(185)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("Selected file: {selected_file}"))
+                            .color(Color32::from_gray(185)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(
+                            "Tab/arrows move selection. Enter commits from the left sidebar.",
+                        )
+                        .color(Color32::from_gray(140)),
+                    );
+                });
+            });
     }
 
     fn draw_error_window(&mut self, ctx: &Context) {
@@ -591,6 +700,7 @@ impl GithubDesktopApp {
             .open(&mut self.state.show_commit_overlay)
             .show(ctx, |ui| {
                 ScrollArea::vertical()
+                    .id_salt("commit_overlay")
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         for line in &self.state.selected_commit_show {
@@ -628,21 +738,22 @@ impl GithubDesktopApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Revert File").clicked() {
+                    if toolbar_button(ui, "Revert File").clicked() {
                         revert_file = true;
                     }
-                    if ui.button("Revert Hunk").clicked() {
+                    if toolbar_button(ui, "Revert Hunk").clicked() {
                         revert_hunk = true;
                     }
-                    if ui.button("Previous Hunk").clicked() {
+                    if toolbar_button(ui, "Previous Hunk").clicked() {
                         previous_hunk = true;
                     }
-                    if ui.button("Next Hunk").clicked() {
+                    if toolbar_button(ui, "Next Hunk").clicked() {
                         next_hunk = true;
                     }
                 });
-                ui.separator();
+                soft_separator(ui);
                 ScrollArea::vertical()
+                    .id_salt("file_overlay")
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         for line in &self.state.selected_file_diff {
@@ -672,26 +783,25 @@ impl App for GithubDesktopApp {
         self.handle_shortcuts(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
 
+        SidePanel::left("commit_sidebar")
+            .resizable(false)
+            .exact_width(360.0)
+            .show(ctx, |ui| {
+                self.draw_commit_sidebar(ui);
+            });
+
         TopBottomPanel::top("header").show(ctx, |ui| self.draw_header(ui));
         TopBottomPanel::bottom("footer")
             .resizable(false)
-            .default_height(108.0)
+            .exact_height(38.0)
             .show(ctx, |ui| self.draw_footer(ui));
 
         SidePanel::right("sidebar")
             .resizable(true)
-            .default_width(440.0)
-            .show(ctx, |ui| {
-                self.draw_worktree(ui);
-                ui.add_space(10.0);
-                self.draw_right_column(ui);
-            });
+            .default_width(380.0)
+            .show(ctx, |ui| self.draw_right_column(ui));
 
-        CentralPanel::default().show(ctx, |ui| {
-            self.draw_commit_graph(ui);
-            ui.add_space(10.0);
-            self.draw_default_branch(ui);
-        });
+        CentralPanel::default().show(ctx, |ui| self.draw_default_branch(ui));
 
         self.draw_commit_window(ctx);
         self.draw_commit_overlay(ctx);
@@ -702,19 +812,21 @@ impl App for GithubDesktopApp {
 
 fn card_frame(ui: &mut Ui, selected: bool, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     let stroke = if selected {
-        Stroke::new(2.0, Color32::from_rgb(255, 214, 10))
+        Stroke::new(1.0, Color32::from_rgb(81, 139, 254))
     } else {
-        Stroke::new(1.0, Color32::from_rgb(58, 80, 107))
+        Stroke::new(1.0, Color32::from_rgb(57, 62, 72))
     };
-    egui::Frame::group(ui.style())
+    egui::Frame::new()
+        .fill(Color32::from_rgb(31, 34, 40))
         .stroke(stroke)
-        .inner_margin(egui::Margin::same(10))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.label(
                     RichText::new(title)
                         .strong()
-                        .color(Color32::from_rgb(114, 239, 221)),
+                        .color(Color32::from_rgb(190, 194, 208)),
                 );
                 ui.add_space(8.0);
                 add_contents(ui);
@@ -729,7 +841,7 @@ fn render_git_graph_line(ui: &mut Ui, line: &str, selected: bool) {
     if selected {
         let rect = ui.available_rect_before_wrap();
         ui.painter()
-            .rect_filled(rect, 4.0, Color32::from_rgb(55, 65, 81));
+            .rect_filled(rect, 6.0, Color32::from_rgb(55, 60, 70));
     }
 
     ui.horizontal_wrapped(|ui| {
@@ -775,7 +887,13 @@ fn render_git_graph_line(ui: &mut Ui, line: &str, selected: bool) {
 }
 
 fn graph_label(ui: &mut Ui, text: &str, color: Color32, selected: bool) {
-    let rich = RichText::new(text.to_string()).color(if selected { Color32::BLACK } else { color });
+    let rich = RichText::new(text.to_string())
+        .family(FontFamily::Monospace)
+        .color(if selected {
+            Color32::from_rgb(233, 236, 241)
+        } else {
+            color
+        });
     ui.label(rich);
 }
 
@@ -804,19 +922,24 @@ fn render_file_change_row(ui: &mut Ui, change: &FileChange, selected: bool, max_
     let empty_blocks = bar_total.saturating_sub(filled);
 
     if selected {
-        ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+        let rect = ui.available_rect_before_wrap();
+        ui.painter()
+            .rect_filled(rect, 6.0, Color32::from_rgb(55, 60, 70));
+        ui.visuals_mut().override_text_color = Some(Color32::from_rgb(233, 236, 241));
     }
     ui.label(
         RichText::new(format!("{:>2}", change.status))
             .color(status_color)
             .strong(),
     );
-    ui.label(trim_display_width(&change.path, 38));
+    ui.label(RichText::new(trim_display_width(&change.path, 28)).family(FontFamily::Proportional));
     ui.label(RichText::new("█".repeat(add_blocks)).color(Color32::from_rgb(80, 200, 120)));
     ui.label(RichText::new("█".repeat(del_blocks)).color(Color32::from_rgb(230, 57, 70)));
-    ui.label(RichText::new("░".repeat(empty_blocks)).color(Color32::DARK_GRAY));
+    ui.label(RichText::new("░".repeat(empty_blocks)).color(Color32::from_gray(80)));
     ui.label(
-        RichText::new(format!("+{} -{}", change.additions, change.deletions)).color(Color32::GRAY),
+        RichText::new(format!("+{} -{}", change.additions, change.deletions))
+            .family(FontFamily::Monospace)
+            .color(Color32::GRAY),
     );
     if selected {
         ui.visuals_mut().override_text_color = None;
@@ -839,6 +962,73 @@ fn render_diff_line(ui: &mut Ui, line: &str) {
         Color32::from_rgb(241, 250, 238)
     };
     ui.monospace(RichText::new(line.to_string()).color(color));
+}
+
+fn apply_theme(ctx: &Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = vec2(8.0, 8.0);
+    style.spacing.button_padding = vec2(12.0, 6.0);
+    style.spacing.indent = 10.0;
+    style.visuals.panel_fill = Color32::from_rgb(36, 39, 46);
+    style.visuals.window_fill = Color32::from_rgb(31, 34, 40);
+    style.visuals.extreme_bg_color = Color32::from_rgb(24, 26, 31);
+    style.visuals.faint_bg_color = Color32::from_rgb(45, 48, 56);
+    style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(31, 34, 40);
+    style.visuals.widgets.noninteractive.bg_stroke =
+        Stroke::new(1.0, Color32::from_rgb(57, 62, 72));
+    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(58, 63, 73);
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(74, 80, 92));
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(72, 78, 90);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(93, 101, 116));
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(81, 139, 254);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(81, 139, 254));
+    style.visuals.widgets.open.bg_fill = Color32::from_rgb(72, 78, 90);
+    style.visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
+    style.visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
+    style.visuals.widgets.active.corner_radius = CornerRadius::same(6);
+    style.visuals.widgets.open.corner_radius = CornerRadius::same(6);
+    style.visuals.override_text_color = Some(Color32::from_rgb(221, 225, 230));
+    style.visuals.selection.bg_fill = Color32::from_rgb(81, 139, 254);
+    style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(201, 218, 248));
+
+    style.text_styles.insert(
+        TextStyle::Heading,
+        FontId::new(24.0, FontFamily::Proportional),
+    );
+    style
+        .text_styles
+        .insert(TextStyle::Body, FontId::new(14.5, FontFamily::Proportional));
+    style.text_styles.insert(
+        TextStyle::Button,
+        FontId::new(13.5, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(13.0, FontFamily::Monospace),
+    );
+    style.text_styles.insert(
+        TextStyle::Small,
+        FontId::new(12.0, FontFamily::Proportional),
+    );
+
+    ctx.set_style(style);
+}
+
+fn toolbar_button(ui: &mut Ui, label: &str) -> egui::Response {
+    ui.add_sized([96.0, 28.0], egui::Button::new(label))
+}
+
+fn sidebar_button(ui: &mut Ui, label: &str, primary: bool) -> egui::Response {
+    let button = egui::Button::new(label).fill(if primary {
+        Color32::from_rgb(64, 120, 244)
+    } else {
+        Color32::from_rgb(58, 63, 73)
+    });
+    ui.add_sized([108.0, 30.0], button)
+}
+
+fn soft_separator(ui: &mut Ui) {
+    ui.separator();
 }
 
 fn refresh_local_data(state: &mut DashboardState) -> Result<()> {
